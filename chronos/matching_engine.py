@@ -1,5 +1,5 @@
 
-"""ChronosMatch: Cython-Accelerated Matching Engine."""
+"""ChronosMatch: Optimized Cython Matching Engine."""
 
 import time
 from dataclasses import dataclass
@@ -50,15 +50,7 @@ class MatchingEngine:
         else:
             resting_orders = self.order_book.bids.get(symbol_id, [])
 
-        # Prepare Cython inputs.
-        prices = []
-        quantities = []
-
-        for entry in resting_orders:
-            prices.append(entry.price)
-            quantities.append(entry.remaining_quantity)
-
-        # MARKET orders have no price limit.
+        # Determine the matching price.
         if order_type == OrderType.MARKET:
             matching_price = (
                 float("inf") if incoming_is_buy else 0.0
@@ -66,7 +58,31 @@ class MatchingEngine:
         else:
             matching_price = order.price
 
-        # Call the updated Cython matching function.
+        # Prepare only eligible resting orders.
+        prices = []
+        quantities = []
+        available_quantity = 0
+
+        for entry in resting_orders:
+
+            # Stop when the price is no longer eligible.
+            if incoming_is_buy:
+                if entry.price > matching_price:
+                    break
+            else:
+                if entry.price < matching_price:
+                    break
+
+            prices.append(entry.price)
+            quantities.append(entry.remaining_quantity)
+
+            available_quantity += entry.remaining_quantity
+
+            # Stop once enough quantity is available.
+            if available_quantity >= order.quantity:
+                break
+
+        # Call the Cython matching function.
         matched_results = match_orders(
             prices,
             quantities,
@@ -75,11 +91,16 @@ class MatchingEngine:
             incoming_is_buy
         )
 
+        # Capture one timestamp for all trades from this order.
+        execution_timestamp_ns = (
+            time.time_ns() if matched_results else 0
+        )
+
         new_trades = []
         total_matched = 0
-        completed_order_ids = set()
+        completed_prefix_count = 0
 
-        # Use the returned index to access resting orders directly.
+        # Process matching results using original order indexes.
         for resting_index, execution_price, matched_qty in matched_results:
 
             resting_entry = resting_orders[resting_index]
@@ -98,7 +119,7 @@ class MatchingEngine:
                 symbol_id=symbol_id,
                 price=execution_price,
                 quantity=matched_qty,
-                execution_timestamp_ns=time.time_ns()
+                execution_timestamp_ns=execution_timestamp_ns
             )
 
             new_trades.append(trade)
@@ -107,19 +128,29 @@ class MatchingEngine:
             total_matched += matched_qty
             resting_entry.remaining_quantity -= matched_qty
 
+            # Fully filled orders form a consecutive prefix
+            # because matching follows price-time priority.
             if resting_entry.remaining_quantity == 0:
-                completed_order_ids.add(resting_id)
 
-        # Remove completely filled orders.
-        if completed_order_ids:
-            resting_orders[:] = [
-                entry for entry in resting_orders
-                if entry.order_id not in completed_order_ids
-            ]
+                if resting_index != completed_prefix_count:
+                    raise RuntimeError(
+                        "Completed orders are not a consecutive priority prefix."
+                    )
 
-            for order_id in completed_order_ids:
-                self.order_book.order_ids.remove(order_id)
+                completed_prefix_count += 1
 
+        # Remove completed orders directly from the front.
+        if completed_prefix_count:
+
+            # Remove completed order IDs from the index.
+            for index in range(completed_prefix_count):
+                resting_id = resting_orders[index].order_id
+                self.order_book.order_ids.remove(resting_id)
+
+            # Remove the completed prefix from the order book.
+            del resting_orders[:completed_prefix_count]
+
+        # Calculate the remaining incoming quantity.
         remaining = order.quantity - total_matched
 
         # Only LIMIT orders can rest in the order book.
